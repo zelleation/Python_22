@@ -5,58 +5,20 @@ from utils.tools import EarlyStopping, adjust_learning_rate, visual, test_params
 from utils.metrics import metric
 
 import numpy as np
+import torch
 import torch.nn as nn
 from torch import optim
 from torch.optim import lr_scheduler
+
 import os
 import time
 
 import warnings
 import matplotlib.pyplot as plt
 import numpy as np
-#mindspore
-import mindspore
-import mindspore.nn
-import mindspore.ops
-import mindspore.dataset
-import mindspore.amp
 
-from mindspore import serialization
-from mindspore import context, Tensor
 warnings.filterwarnings('ignore')
-def new_adjust_learning_rate(optimizer, scheduler_last_lr,epoch, args, printout=True):
-    # 根据epoch和args确定学习率调整策略
-    if args.lradj == 'type1':
-        lr_adjust = args.learning_rate * (0.5 ** ((epoch - 1) // 1))
-    elif args.lradj == 'type2':
-        lr_adjust_map = {
-            2: 5e-5, 4: 1e-5, 6: 5e-6, 8: 1e-6,
-            10: 5e-7, 15: 1e-7, 20: 5e-8
-        }
-        lr_adjust = lr_adjust_map.get(epoch, args.learning_rate)
-    elif args.lradj == 'type3':
-        lr_adjust = args.learning_rate if epoch < 3 else args.learning_rate * (0.8 ** ((epoch - 3) // 1))
-    elif args.lradj == 'constant':
-        lr_adjust = args.learning_rate
-    elif args.lradj == '3':
-        lr_adjust = args.learning_rate if epoch < 10 else args.learning_rate * 0.1
-    elif args.lradj == '4':
-        lr_adjust = args.learning_rate if epoch < 15 else args.learning_rate * 0.1
-    elif args.lradj == '5':
-        lr_adjust = args.learning_rate if epoch < 25 else args.learning_rate * 0.1
-    elif args.lradj == '6':
-        lr_adjust = args.learning_rate if epoch < 5 else args.learning_rate * 0.1
-    elif args.lradj == 'TST':
-        # 假设scheduler_last_lr是一个包含最后学习率的变量
-        lr_adjust = scheduler_last_lr
-    else:
-        lr_adjust = args.learning_rate
 
-    # 更新优化器的学习率
-    optimizer.set_lr(lr_adjust)
-
-    if printout:
-        print('Updating learning rate to {}'.format(lr_adjust))
 
 class Exp_Main(Exp_Basic):
     def __init__(self, args):
@@ -75,8 +37,7 @@ class Exp_Main(Exp_Basic):
         model = model_dict[self.args.model].Model(self.args).float()
 
         if self.args.use_multi_gpu and self.args.use_gpu:
-            pass#context.set_context(mode=context.GRAPH_MODE, device_target="GPU", device_id=self.args.device_ids)#model = nn.DataParallel(model, device_ids=self.args.device_ids)
-            #它也不支持，咱也用不上
+            model = nn.DataParallel(model, device_ids=self.args.device_ids)
         return model
 
     def _get_data(self, flag):
@@ -84,67 +45,66 @@ class Exp_Main(Exp_Basic):
         return data_set, data_loader
 
     def _select_optimizer(self):
-        model_optim = mindspore.experimental.optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
+        model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
         return model_optim
 
     def _select_criterion(self):
         if self.args.loss == "mae":
-            criterion = mindspore.nn.L1Loss()
+            criterion = nn.L1Loss()
         elif self.args.loss == "mse":
-            criterion = mindspore.nn.MSELoss()
+            criterion = nn.MSELoss()
         elif self.args.loss == "smooth":
-            criterion = mindspore.nn.SmoothL1Loss()
+            criterion = nn.SmoothL1Loss()
         else:
-            criterion = mindspore.nn.MSELoss()
+            criterion = nn.MSELoss()
         return criterion
 
     def vali(self, vali_data, vali_loader, criterion):
         total_loss = []
         self.model.eval()
-#        with torch.no_grad():
-        for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(vali_loader):
-            batch_x = batch_x.float().to(self.device)
-            batch_y = batch_y.float()
+        with torch.no_grad():
+            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(vali_loader):
+                batch_x = batch_x.float().to(self.device)
+                batch_y = batch_y.float()
 
-            batch_x_mark = batch_x_mark.float().to(self.device)
-            batch_y_mark = batch_y_mark.float().to(self.device)
+                batch_x_mark = batch_x_mark.float().to(self.device)
+                batch_y_mark = batch_y_mark.float().to(self.device)
 
-            # decoder input
-            dec_inp = mindspore.ops.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
-            dec_inp = mindspore.ops.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
-            # encoder - decoder
-            if self.args.use_amp:
-                #with torch.cuda.amp.autocast():
-                if any(substr in self.args.model for substr in {'Linear', 'TST', 'SparseTSF'}):
-                    outputs = self.model(batch_x)
+                # decoder input
+                dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
+                dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
+                # encoder - decoder
+                if self.args.use_amp:
+                    with torch.cuda.amp.autocast():
+                        if any(substr in self.args.model for substr in {'Linear', 'TST', 'SparseTSF'}):
+                            outputs = self.model(batch_x)
+                        else:
+                            if self.args.output_attention:
+                                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                            else:
+                                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                 else:
-                    if self.args.output_attention:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                    if any(substr in self.args.model for substr in {'Linear', 'TST', 'SparseTSF'}):
+                        outputs = self.model(batch_x)
                     else:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-            else:
-                if any(substr in self.args.model for substr in {'Linear', 'TST', 'SparseTSF'}):
-                    outputs = self.model(batch_x)
-                else:
-                    if self.args.output_attention:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
-                    else:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-            f_dim = -1 if self.args.features == 'MS' else 0
-            outputs = outputs[:, -self.args.pred_len:, f_dim:]
-            batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+                        if self.args.output_attention:
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                        else:
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                f_dim = -1 if self.args.features == 'MS' else 0
+                outputs = outputs[:, -self.args.pred_len:, f_dim:]
+                batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
 
-            pred = outputs.detach().cpu()
-            true = batch_y.detach().cpu()
+                pred = outputs.detach().cpu()
+                true = batch_y.detach().cpu()
 
-            loss = criterion(pred, true)
+                loss = criterion(pred, true)
 
-            total_loss.append(loss)
-
+                total_loss.append(loss)
         total_loss = np.average(total_loss)
         self.model.train()
         return total_loss
-    
+
     def train(self, setting):
         train_data, train_loader = self._get_data(flag='train')
         vali_data, vali_loader = self._get_data(flag='val')
@@ -163,14 +123,13 @@ class Exp_Main(Exp_Basic):
         criterion = self._select_criterion()
 
         if self.args.use_amp:
-            scaler = mindspore.amp.DynamicLossScaler()
+            scaler = torch.cuda.amp.GradScaler()
 
         scheduler = lr_scheduler.OneCycleLR(optimizer=model_optim,
                                             steps_per_epoch=train_steps,
                                             pct_start=self.args.pct_start,
                                             epochs=self.args.train_epochs,
                                             max_lr=self.args.learning_rate)
-        scheduler=mindspore.nn.learning_rate_schedule.ExponentialDecayLR(self.args.learning_rate, 0.9, self.args.train_epochs)
 
         for epoch in range(self.args.train_epochs):
             iter_count = 0
@@ -187,25 +146,25 @@ class Exp_Main(Exp_Basic):
                 batch_y_mark = batch_y_mark.float().to(self.device)
 
                 # decoder input
-                dec_inp = mindspore.ops.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
-                dec_inp = mindspore.ops.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
+                dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
+                dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
 
                 # encoder - decoder
                 if self.args.use_amp:
-                    #with torch.cuda.amp.autocast():
-                    if any(substr in self.args.model for substr in {'Linear', 'TST', 'SparseTSF'}):
-                        outputs = self.model(batch_x)
-                    else:
-                        if self.args.output_attention:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                    with torch.cuda.amp.autocast():
+                        if any(substr in self.args.model for substr in {'Linear', 'TST', 'SparseTSF'}):
+                            outputs = self.model(batch_x)
                         else:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)#为什么可以传入这么多参数？A: 这是因为模型的forward函数定义了这么多参数，没有啊，只有一个输入参数forward(self, x).A: 这是因为forward函数的参数是可变的，可以传入任意多个参数，但是在实际调用时，只传入了一个参数。
+                            if self.args.output_attention:
+                                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                            else:
+                                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
 
-                    f_dim = -1 if self.args.features == 'MS' else 0
-                    outputs = outputs[:, -self.args.pred_len:, f_dim:]
-                    batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
-                    loss = criterion(outputs, batch_y)
-                    train_loss.append(loss.item())
+                        f_dim = -1 if self.args.features == 'MS' else 0
+                        outputs = outputs[:, -self.args.pred_len:, f_dim:]
+                        batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+                        loss = criterion(outputs, batch_y)
+                        train_loss.append(loss.item())
                 else:
                     if any(substr in self.args.model for substr in {'Linear', 'TST', 'SparseTSF'}):
                         outputs = self.model(batch_x)
@@ -231,19 +190,16 @@ class Exp_Main(Exp_Basic):
                     time_now = time.time()
 
                 if self.args.use_amp:
-                    scaled_loss = scaler.scale(loss)
-                    scaled_loss.backward()
-                    scaler.minimize(model_optim, scaled_loss)
+                    scaler.scale(loss).backward()
+                    scaler.step(model_optim)
+                    scaler.update()
                 else:
                     loss.backward()
                     model_optim.step()
-                    
 
-
-                if self.args.lradj == 'TST':#TST是什么？A: TST是一个调整学习率的方法，可以在训练过程中动态调整学习率
-                    global_step = epoch * train_steps + i
-                    new_lr=scheduler(global_step)
-                    new_adjust_learning_rate(model_optim, new_lr, epoch + 1, self.args, printout=False)
+                if self.args.lradj == 'TST':
+                    adjust_learning_rate(model_optim, scheduler, epoch + 1, self.args, printout=False)
+                    scheduler.step()
 
             print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
             train_loss = np.average(train_loss)
@@ -258,21 +214,164 @@ class Exp_Main(Exp_Basic):
                 break
 
             if self.args.lradj != 'TST':
-                new_adjust_learning_rate(model_optim, 0, epoch + 1, self.args)
+                adjust_learning_rate(model_optim, scheduler, epoch + 1, self.args)
             else:
                 print('Updating learning rate to {}'.format(scheduler.get_last_lr()[0]))
 
-        best_model_path = os.path.join(path ,'checkpoint.ckpt')#这是什么？.pth是什么文件？A: .pth是pytorch的模型文件，保存了模型的参数，可以用来恢复模型。
-        #mindspore中的模型文件是什么？A: .ckpt是mindspore的模型文件，保存了模型的参数，可以用来恢复模型。会自动保存吗？A: 会的，可以通过设置checkpoint保存模型。
-        if os.path.exists(best_model_path):
-            self.model.set_param_dict(serialization.load_checkpoint(best_model_path))#self.model.load_state_dict(torch.load(best_model_path, map_location="cuda:0"))
+        best_model_path = path + '/' + 'checkpoint.pth'
+        self.model.load_state_dict(torch.load(best_model_path, map_location="cuda:0"))
+
 
         return self.model
 
     def test(self, setting, test=0):
-       
+        test_data, test_loader = self._get_data(flag='test')
+
+        if test:
+            print('loading model')
+            self.model.load_state_dict(torch.load(os.path.join('./checkpoints/' + setting, 'checkpoint.pth'), map_location="cuda:0"))
+
+        preds = []
+        trues = []
+        inputx = []
+        folder_path = './test_results/' + setting + '/'
+        if not os.path.exists(folder_path):
+            os.makedirs(folder_path)
+
+        self.model.eval()
+        with torch.no_grad():
+            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(test_loader):
+                batch_x = batch_x.float().to(self.device)
+                batch_y = batch_y.float().to(self.device)
+
+                batch_x_mark = batch_x_mark.float().to(self.device)
+                batch_y_mark = batch_y_mark.float().to(self.device)
+
+                # decoder input
+                dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
+                dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
+                # encoder - decoder
+                if self.args.use_amp:
+                    with torch.cuda.amp.autocast():
+                        if any(substr in self.args.model for substr in {'Linear', 'TST', 'SparseTSF'}):
+                            outputs = self.model(batch_x)
+                        else:
+                            if self.args.output_attention:
+                                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                            else:
+                                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                else:
+                    if any(substr in self.args.model for substr in {'Linear', 'TST', 'SparseTSF'}):
+                        outputs = self.model(batch_x)
+                    else:
+                        if self.args.output_attention:
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+
+                        else:
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+
+                f_dim = -1 if self.args.features == 'MS' else 0
+                # print(outputs.shape,batch_y.shape)
+                outputs = outputs[:, -self.args.pred_len:, f_dim:]
+                batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+                outputs = outputs.detach().cpu().numpy()
+                batch_y = batch_y.detach().cpu().numpy()
+
+                pred = outputs  # outputs.detach().cpu().numpy()  # .squeeze()
+                true = batch_y  # batch_y.detach().cpu().numpy()  # .squeeze()
+
+                preds.append(pred)
+                trues.append(true)
+                inputx.append(batch_x.detach().cpu().numpy())
+                if i % 20 == 0:
+                    input = batch_x.detach().cpu().numpy()
+                    gt = np.concatenate((input[0, :, -1], true[0, :, -1]), axis=0)
+                    pd = np.concatenate((input[0, :, -1], pred[0, :, -1]), axis=0)
+                    visual(gt, pd, os.path.join(folder_path, str(i) + '.pdf'))
+
+        if self.args.test_flop:
+            test_params_flop(self.model, (batch_x.shape[1],batch_x.shape[2]))
+            # test_params_flop((batch_x.shape[1], batch_x.shape[2]))
+            exit()
+        preds = np.array(preds)
+        trues = np.array(trues)
+        inputx = np.array(inputx)
+
+        preds = preds.reshape(-1, preds.shape[-2], preds.shape[-1])
+        trues = trues.reshape(-1, trues.shape[-2], trues.shape[-1])
+        inputx = inputx.reshape(-1, inputx.shape[-2], inputx.shape[-1])
+
+        # result save
+        folder_path = './results/' + setting + '/'
+        if not os.path.exists(folder_path):
+            os.makedirs(folder_path)
+
+        mae, mse, rmse, mape, mspe, rse, corr = metric(preds, trues)
+        print('mse:{}, mae:{}, rse:{}'.format(mse, mae, rse))
+        f = open("result.txt", 'a')
+        f.write(setting + "  \n")
+        f.write('mse:{}, mae:{}, rse:{}'.format(mse, mae, rse))
+        f.write('\n')
+        f.write('\n')
+        f.close()
+
+        # np.save(folder_path + 'metrics.npy', np.array([mae, mse, rmse, mape, mspe,rse, corr]))
+        # np.save(folder_path + 'pred.npy', preds)
+        # np.save(folder_path + 'true.npy', trues)
+        # np.save(folder_path + 'x.npy', inputx)
         return
 
     def predict(self, setting, load=False):
-       
+        pred_data, pred_loader = self._get_data(flag='pred')
+
+        if load:
+            path = os.path.join(self.args.checkpoints, setting)
+            best_model_path = path + '/' + 'checkpoint.pth'
+            self.model.load_state_dict(torch.load(best_model_path))
+
+        preds = []
+
+        self.model.eval()
+        with torch.no_grad():
+            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(pred_loader):
+                batch_x = batch_x.float().to(self.device)
+                batch_y = batch_y.float()
+                batch_x_mark = batch_x_mark.float().to(self.device)
+                batch_y_mark = batch_y_mark.float().to(self.device)
+
+                # decoder input
+                dec_inp = torch.zeros([batch_y.shape[0], self.args.pred_len, batch_y.shape[2]]).float().to(
+                    batch_y.device)
+                dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
+                # encoder - decoder
+                if self.args.use_amp:
+                    with torch.cuda.amp.autocast():
+                        if any(substr in self.args.model for substr in {'Linear', 'TST', 'SparseTSF'}):
+                            outputs = self.model(batch_x)
+                        else:
+                            if self.args.output_attention:
+                                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                            else:
+                                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                else:
+                    if any(substr in self.args.model for substr in {'Linear', 'TST', 'SparseTSF'}):
+                        outputs = self.model(batch_x)
+                    else:
+                        if self.args.output_attention:
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                        else:
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                pred = outputs.detach().cpu().numpy()  # .squeeze()
+                preds.append(pred)
+
+        preds = np.array(preds)
+        preds = preds.reshape(-1, preds.shape[-2], preds.shape[-1])
+
+        # result save
+        folder_path = './results/' + setting + '/'
+        if not os.path.exists(folder_path):
+            os.makedirs(folder_path)
+
+        np.save(folder_path + 'real_prediction.npy', preds)
+
         return
